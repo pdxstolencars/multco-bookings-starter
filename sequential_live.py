@@ -50,6 +50,15 @@ def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def charges_absent(record: dict) -> bool:
+    """Only a validated, explicitly empty simple charge list needs a retry.
+
+    Avoid classifying synthetic records that omit the field entirely as empty.
+    The full parser always supplies a list, even when MCSO has not posted charges.
+    """
+    return isinstance(record, dict) and isinstance(record.get("charges"), list) and not record["charges"]
+
+
 def candidate_url(booking_id: int) -> str:
     if not 1 <= booking_id <= 999999999999:
         raise ValueError("Invalid booking ID")
@@ -158,6 +167,35 @@ class PrivateStore:
             raise ValueError("Invalid booking ID in parsed record")
         self._write(f"{self.prefix}/records/{bid}.json", {"private_full_record": True, "record": record})
 
+    def discover_records_without_charges(self) -> list[int]:
+        """One-time migration for already saved empty-charge records.
+
+        Scan both historical range and daily folders; a populated copy wins
+        if the same ID exists under both prefixes.
+        """
+        by_id: dict[int, bool] = {}
+        for folder in (RANGE_PREFIX, DAILY_PREFIX):
+            prefix = f"{folder}/records/"
+            for page in self.client.get_paginator("list_objects_v2").paginate(
+                Bucket=self.bucket, Prefix=prefix
+            ):
+                for item in page.get("Contents", []):
+                    key = item.get("Key", "")
+                    if not re.fullmatch(re.escape(prefix) + r"\d{1,12}\.json", key):
+                        continue
+                    envelope = json.loads(
+                        self.client.get_object(Bucket=self.bucket, Key=key)["Body"].read()
+                    )
+                    if not isinstance(envelope, dict) or envelope.get("private_full_record") is not True:
+                        raise ValueError("Unrecognized stored booking record envelope")
+                    record = envelope.get("record")
+                    if not isinstance(record, dict) or not re.fullmatch(r"\d{1,12}", str(record.get("booking_id", ""))):
+                        raise ValueError("Invalid saved booking ID")
+                    bid = int(record["booking_id"])
+                    # Never queue records that already contain charges in either store.
+                    by_id[bid] = by_id.get(bid, False) or not charges_absent(record)
+        return sorted(bid for bid, has_charges in by_id.items() if not has_charges)
+
 
 class LocalStore:
     """For repeatable tests; never uses the public website or live archive."""
@@ -180,6 +218,17 @@ class LocalStore:
         p = self.records / (bid + ".json")
         p.write_text(json.dumps({"private_full_record": True, "record": record}, indent=2), encoding="utf-8")
 
+    def discover_records_without_charges(self) -> list[int]:
+        ids = []
+        for p in self.records.glob("*.json") if self.records.exists() else []:
+            envelope = json.loads(p.read_text(encoding="utf-8"))
+            if envelope.get("private_full_record") is not True:
+                raise ValueError("Unexpected local booking record envelope")
+            record = envelope.get("record")
+            if charges_absent(record):
+                ids.append(int(record["booking_id"]))
+        return sorted(set(ids))
+
 
 def new_state(mode: str, start: int, end: int | None) -> dict:
     if start < 1 or end is not None and end < start:
@@ -192,6 +241,7 @@ def new_state(mode: str, start: int, end: int | None) -> dict:
         "missing_streak": 0, "found_count": 0, "missing_count": 0,
         "run_count": 0, "last_checked_id": None, "last_run_utc": None,
         "complete": False, "pending_missing_ids": [], "recheck_cursor": 0,
+        "pending_charge_ids": [], "charge_backfill_done": False,
     }
 
 
@@ -236,6 +286,43 @@ def repair_legacy_daily_checkpoint(state: dict) -> bool:
         changed = True
         print(f"Migrated previous missing-ID tail; next forward candidate {state['next_candidate']}")
     return changed
+
+
+def prepare_charge_rechecks(state_store, state: dict) -> bool:
+    """Import existing empty-charge records once, before handling new IDs.
+
+    This does not reset or modify forward/missing booking checkpoints.
+    """
+    if state.get("mode") != "daily":
+        return False
+    changed = "pending_charge_ids" not in state or "charge_backfill_done" not in state
+    state.setdefault("pending_charge_ids", [])
+    state.setdefault("charge_backfill_done", False)
+    pending = state["pending_charge_ids"]
+    if not isinstance(pending, list) or any(not isinstance(i, int) or i < 1 for i in pending):
+        raise ValueError("Invalid charge recheck queue")
+    if not isinstance(state["charge_backfill_done"], bool):
+        raise ValueError("Invalid charge migration state")
+    if not state["charge_backfill_done"]:
+        found = state_store.discover_records_without_charges()
+        state["pending_charge_ids"] = list(dict.fromkeys(pending + found))
+        state["charge_backfill_done"] = True
+        print(f"Found {len(found)} archived booking IDs needing charge rechecks")
+        changed = True
+    return changed
+
+
+def queue_unposted_charges(state: dict, bid: int, record: dict) -> None:
+    """Keep only empty-charge bookings queued, without affecting found totals."""
+    if state.get("mode") != "daily" or not isinstance(record.get("charges"), list):
+        return
+    queue = state.setdefault("pending_charge_ids", [])
+    if charges_absent(record):
+        if bid not in queue:
+            queue.append(bid)
+            print(f"ID {bid}: charges not listed yet; queued for next hourly recheck")
+    elif bid in queue:
+        queue.remove(bid)
 
 
 def apply_late_found(state: dict, bid: int) -> dict:
@@ -287,11 +374,16 @@ def scan(state_store, fetch: Callable[[int], PageResult], mode: str, start: int,
     state = state_store.load()
     if state is None:
         state = new_state(mode, start, end)
+        if mode == "daily":
+            # Recover orphaned saved records if a prior checkpoint write failed.
+            prepare_charge_rechecks(state_store, state)
         state_store.save(state)
         print(f"New PRIVATE {mode} checkpoint: starts at {start}")
     else:
         validate_state(state, mode, start, end)
-        if repair_legacy_daily_checkpoint(state):
+        checkpoint_repaired = repair_legacy_daily_checkpoint(state)
+        charge_queue_prepared = prepare_charge_rechecks(state_store, state)
+        if checkpoint_repaired or charge_queue_prepared:
             state_store.save(state)
         print(f"Resuming PRIVATE {mode} checkpoint from ID {state['next_candidate']}")
     if state["complete"]:
@@ -301,10 +393,56 @@ def scan(state_store, fetch: Callable[[int], PageResult], mode: str, start: int,
     state["last_run_utc"] = now_utc()
     state_store.save(state)
     processed = 0
+    # Recheck bookings that were saved without charges in PREVIOUS runs.
+    # Do it before the forward scan, so the next run always attempts a retry.
+    # Rotate unresolved IDs to avoid starving later records if the queue grows.
+    prior_charge_ids = list(state.get("pending_charge_ids", [])) if mode == "daily" else []
+    for missing_charge_id in prior_charge_ids[:min(10, max_requests)]:
+        try:
+            result = fetch(missing_charge_id)
+        except AccessStopped:
+            # A real access block must stop all collection immediately.
+            print(f"STOP: access restriction during charge recheck {missing_charge_id}", file=sys.stderr)
+            raise
+        except ScanError:
+            # A single old booking that is temporarily unavailable must not
+            # prevent the rest of the hourly NEW-booking collection.
+            print(f"CHARGE RECHECK {missing_charge_id}: temporarily unavailable; will retry next run")
+            result = None
+        if result is None:
+            state["pending_charge_ids"].remove(missing_charge_id)
+            state["pending_charge_ids"].append(missing_charge_id)
+            processed += 1
+            state_store.save(state)
+            if delay and processed < min(10, max_requests):
+                sleep(delay)
+            continue
+        if result.kind == "FOUND":
+            if not result.record or str(result.record.get("booking_id")) != str(missing_charge_id):
+                raise ScanError("Invalid charge recheck record")
+            # Original record is kept until a fully validated replacement exists.
+            if charges_absent(result.record):
+                print(f"CHARGE RECHECK {missing_charge_id}: charges still not posted")
+            else:
+                state_store.save_record(result.record)
+                state["pending_charge_ids"].remove(missing_charge_id)
+                print(f"CHARGE RECHECK {missing_charge_id}: now {len(result.record.get('charges', []))} charge(s); record updated")
+        elif result.kind == "MISSING":
+            print(f"CHARGE RECHECK {missing_charge_id}: page temporarily missing; saved record retained")
+        else:
+            raise ScanError("Unknown charge recheck status")
+        # Requeue unresolved records at the back, so each gets a turn.
+        if missing_charge_id in state["pending_charge_ids"]:
+            state["pending_charge_ids"].remove(missing_charge_id)
+            state["pending_charge_ids"].append(missing_charge_id)
+        processed += 1
+        state_store.save(state)
+        if delay and processed < min(10, max_requests):
+            sleep(delay)
     # Snapshot only prior-run gaps. Never fetch a just-checked missing ID twice
     # in the same run, and always prioritize new forward bookings.
     previous_missing = list(state.get("pending_missing_ids", [])) if mode == "daily" else []
-    for idx in range(max_requests):
+    for idx in range(max_requests - processed):
         candidate = state["next_candidate"]
         if end is not None and candidate > end:
             state["complete"] = True
@@ -322,6 +460,7 @@ def scan(state_store, fetch: Callable[[int], PageResult], mode: str, start: int,
             # Write the full record BEFORE advancing checkpoint; replay is safe.
             state_store.save_record(result.record)
             state = apply_found(state, candidate)
+            queue_unposted_charges(state, candidate, result.record)
         elif result.kind == "MISSING":
             state, stop = apply_missing(state, candidate, missing_threshold)
         else:
@@ -357,6 +496,7 @@ def scan(state_store, fetch: Callable[[int], PageResult], mode: str, start: int,
                     raise ScanError("Invalid late booking; checkpoint unchanged")
                 state_store.save_record(result.record)
                 state = apply_late_found(state, missing_id)
+                queue_unposted_charges(state, missing_id, result.record)
                 print(f"LATE ID {missing_id}: FOUND; recovered without rewinding forward cursor")
             elif result.kind == "MISSING":
                 print(f"LATE ID {missing_id}: still MISSING")
@@ -372,6 +512,7 @@ def scan(state_store, fetch: Callable[[int], PageResult], mode: str, start: int,
           f"mode={mode} checked={processed} total_found={state['found_count']}",
           f"unresolved_missing={state['missing_count']} next={state['next_candidate']}",
           f"pending_rechecks={len(state.get('pending_missing_ids', []))}",
+          f"pending_charge_rechecks={len(state.get('pending_charge_ids', []))}",
           f"complete={state['complete']} runs={state['run_count']}")
     print("PRIVATE R2 ONLY. Production archive and public GitHub Pages site not changed.")
     return state
