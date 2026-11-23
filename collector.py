@@ -276,6 +276,51 @@ def gather_links(page) -> list[str]:
     return sorted(all_links)
 
 
+
+def probe(contact: str = "", sample_size: int = 3) -> None:
+    """One-time, read-only live diagnostic; DOES NOT touch R2 or public site files.
+
+    Use the public last-seven-days form, retrieve up to three detail pages, and
+    report only aggregate diagnostics (not names or personal information).
+    Fail closed if robots instructions disallow or cannot be verified.
+    """
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", contact):
+        raise ValueError("Set SCRAPER_CONTACT to a real email for bot identification")
+    ua = f"MultCoBookingMonitor/0.3 (read-only diagnostic; contact: {contact})"
+    if not allowed_to_scrape(ua):
+        raise RuntimeError("Robots policy disallows the test or could not be verified. No requests to the booking search were made.")
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        try:
+            context = browser.new_context(user_agent=ua)
+            page = context.new_page()
+            links = gather_links(page)
+            LOG.info("LIVE PROBE: %d official booking links found", len(links))
+            release_specific = [u for u in links if "&releaseId=" in u]
+            LOG.info("LIVE PROBE: %d release-specific links among results", len(release_specific))
+            chosen = []
+            for link in (links[:2] + release_specific[:1] + links[-1:]):
+                if link not in chosen:
+                    chosen.append(link)
+                if len(chosen) >= sample_size:
+                    break
+            passed = 0
+            with_charges = 0
+            for link in chosen:
+                page.goto(link, wait_until="domcontentloaded", timeout=30000)
+                parsed = parse_booking_html(page.content(), link)
+                if parsed is None:
+                    raise RuntimeError("A detail page did not match our parser. Do not enable daily collection yet.")
+                passed += 1
+                with_charges += bool(parsed["charges"])
+                page.wait_for_timeout(1200)
+            LOG.info("LIVE PROBE PASSED: %d/%d detail pages parsed, %d included charges; NO archive or website modified",
+                     passed, len(chosen), with_charges)
+        finally:
+            browser.close()
+
+
 def collect(contact: str = "", site: Path = Path("site")) -> int:
     if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", contact):
         raise ValueError("Set SCRAPER_CONTACT to a real email for respectful bot identification")
@@ -330,6 +375,7 @@ def collect(contact: str = "", site: Path = Path("site")) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--site", type=Path, default=Path("site"))
+    parser.add_argument("--probe", action="store_true", help="Read-only live test; do not write archive or publish records")
     parser.add_argument("--test-html", type=Path, help="Test only: parse saved, non-real HTML fixture")
     parser.add_argument("--test-url", default="https://apps.mcso.us/PAID/Home/Booking?id=9999999")
     args = parser.parse_args()
@@ -337,6 +383,8 @@ def main() -> None:
     try:
         if args.test_html:
             print(json.dumps(parse_booking_html(args.test_html.read_text(), args.test_url), indent=2))
+        elif args.probe:
+            probe(os.getenv("SCRAPER_CONTACT", ""))
         else:
             collect(os.getenv("SCRAPER_CONTACT", ""), args.site)
     except Exception as exc:
