@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 from sequential_live import (
     AccessStopped, LocalStore, PageResult, ScanError,
+    TransientServerError, retry_transient_server_error,
     apply_found, apply_missing, candidate_url, classify_page, new_state, scan,
 )
 
@@ -70,7 +71,7 @@ def test_range_resumes_through_misses_and_finishes(tmp_path):
     assert c['found_count'] == 3 and c['run_count'] == 2
 
 
-def test_daily_stops_at_five_and_rechecks_tail(tmp_path):
+def test_daily_stops_at_five_and_advances_beyond_gap(tmp_path):
     store = LocalStore(tmp_path / 'daily.json')
     calls = []
     def fetch(bid):
@@ -78,12 +79,51 @@ def test_daily_stops_at_five_and_rechecks_tail(tmp_path):
         return fake_found(bid) if bid in (1658165, 1658167) else PageResult('MISSING')
     a = scan(store, fetch, 'daily', 1658165, None, max_requests=50, missing_threshold=5, delay=0)
     assert calls == list(range(1658165, 1658173))
-    assert a['next_candidate'] == 1658168
+    assert a['next_candidate'] == 1658173
     assert a['found_count'] == 2
+    assert a['pending_missing_ids'] == [1658166] + list(range(1658168, 1658173))
     calls.clear()
     b = scan(store, fetch, 'daily', 1658165, None, max_requests=20, missing_threshold=5, delay=0)
-    assert calls == list(range(1658168, 1658173))
-    assert b['next_candidate'] == 1658168
+    assert calls[:5] == list(range(1658173, 1658178))
+    assert calls[5:] == [1658166, 1658168, 1658169, 1658170, 1658171]
+    assert b['next_candidate'] == 1658178
+
+
+def test_migrates_real_previous_stopping_checkpoint_and_recovers_late_id(tmp_path):
+    store = LocalStore(tmp_path / 'daily.json')
+    old = {
+        'schema': 1, 'mode':'daily', 'start_id': 1658165, 'end_id':None,
+        'next_candidate':1658175, 'highest_found_id':1658174,
+        'missing_streak':0, 'found_count':10, 'missing_count':5,
+        'run_count':1, 'last_checked_id':1658179, 'last_run_utc':None,
+        'complete':False,
+    }
+    store.save(old)
+    calls = []
+    def fetch(bid):
+        calls.append(bid)
+        return fake_found(bid) if bid == 1658176 else PageResult('MISSING')
+    result = scan(store, fetch, 'daily', 1658165, None,
+                  max_requests=10, missing_threshold=5, delay=0)
+    assert calls[:5] == list(range(1658180, 1658185))
+    assert calls[5:] == list(range(1658175, 1658180))
+    assert result['next_candidate'] == 1658185
+    assert 1658176 not in result['pending_missing_ids']
+    assert result['found_count'] == 11 and result['missing_count'] == 9
+    assert (store.records / '1658176.json').exists()
+    assert store.load()['next_candidate'] == 1658185
+
+
+def test_daily_range_has_no_double_count_for_missing_recheck(tmp_path):
+    store = LocalStore(tmp_path / 'daily.json')
+    f = lambda bid: PageResult('MISSING')
+    a = scan(store, f, 'daily', 1658165, None, max_requests=10, delay=0)
+    assert a['found_count'] == 0 and a['missing_count'] == 5
+    b = scan(store, f, 'daily', 1658165, None, max_requests=10, delay=0)
+    assert b['next_candidate'] == 1658175
+    assert b['missing_count'] == 10
+    assert b['pending_missing_ids'] == list(range(1658165,1658175))
+
 
 
 def test_interrupted_request_does_not_advance(tmp_path):
@@ -110,3 +150,50 @@ def test_save_record_before_checkpoint(tmp_path):
     with pytest.raises(OSError):
         scan(store, lambda x: fake_found(x), 'range', 1658100, 1658100, delay=0)
     assert store.load()['next_candidate'] == 1658100
+
+
+def test_server_error_is_retriable_but_challenge_is_not():
+    bid = 1658109
+    url = candidate_url(bid)
+    with pytest.raises(TransientServerError, match="503"):
+        classify_page(503, "<html><body>Service unavailable</body></html>", bid, url)
+    with pytest.raises(AccessStopped):
+        classify_page(503, "<html><body>Verify you are human: CAPTCHA</body></html>", bid, url)
+
+
+def test_retry_only_temporary_server_error():
+    attempted = []
+    waits = []
+    def flaky():
+        attempted.append(1)
+        if len(attempted) < 3:
+            raise TransientServerError("HTTP 503")
+        return PageResult("MISSING")
+    outcome = retry_transient_server_error(flaky, 1658109, sleep=waits.append)
+    assert outcome.kind == "MISSING"
+    assert len(attempted) == 3
+    assert waits == [10.0, 30.0]
+
+
+def test_retry_exhausted_stops_without_advancing_checkpoint(tmp_path):
+    store = LocalStore(tmp_path / "range.json")
+    calls = []
+    def always_503():
+        calls.append(1)
+        raise TransientServerError("HTTP 503")
+    def fetch(bid):
+        return retry_transient_server_error(always_503, bid, backoffs=(0, 0), sleep=lambda _: None)
+    with pytest.raises(TransientServerError):
+        scan(store, fetch, "range", 1658100, 1658163, delay=0)
+    assert len(calls) == 3
+    assert store.load()["next_candidate"] == 1658100
+
+
+def test_access_block_does_not_retry():
+    calls = []
+    def blocked():
+        calls.append(1)
+        raise AccessStopped("access denied")
+    with pytest.raises(AccessStopped):
+        retry_transient_server_error(blocked, 1658109, sleep=lambda _: None)
+    assert len(calls) == 1
