@@ -4,7 +4,8 @@ Modes:
   range: finite inclusive ID range, resumes until every candidate is checked;
          five misses do NOT truncate a specifically requested historical range.
   daily: starts after the provided seed ID; stops after five confirmed missing
-         booking pages, rechecking the unconfirmed tail on the next run.
+         booking pages. The forward cursor advances between runs, while a
+         separate pending-missing queue is rechecked for late-appearing records.
 
 This program does not access the search form, solve CAPTCHAs, hide identity,
 rotate IPs, or continue after rate limits / blocked responses. Use only within
@@ -190,7 +191,7 @@ def new_state(mode: str, start: int, end: int | None) -> dict:
         "next_candidate": start, "highest_found_id": start - 1,
         "missing_streak": 0, "found_count": 0, "missing_count": 0,
         "run_count": 0, "last_checked_id": None, "last_run_utc": None,
-        "complete": False,
+        "complete": False, "pending_missing_ids": [], "recheck_cursor": 0,
     }
 
 
@@ -204,6 +205,49 @@ def validate_state(state: dict, mode: str, start: int, end: int | None) -> None:
     )):
         raise ValueError("Stored checkpoint differs from requested scan; refusing to overwrite")
 
+
+
+def repair_legacy_daily_checkpoint(state: dict) -> bool:
+    """Upgrade a prior rewind-on-five-misses checkpoint without losing IDs.
+
+    The old implementation stored next_candidate at highest_found+1 while
+    last_checked_id pointed to the last confirmed missing page. Preserve the
+    five missed IDs in a separate durable queue and move forward from there.
+    This is deliberately idempotent and requires no user-edited R2 objects.
+    """
+    if state.get("mode") != "daily":
+        return False
+    changed = "pending_missing_ids" not in state or "recheck_cursor" not in state
+    state.setdefault("pending_missing_ids", [])
+    state.setdefault("recheck_cursor", 0)
+    pending = state["pending_missing_ids"]
+    if not isinstance(pending, list) or any(not isinstance(x, int) or x < state["start_id"] for x in pending):
+        raise ValueError("Invalid pending missing IDs in checkpoint")
+    if not isinstance(state["recheck_cursor"], int) or state["recheck_cursor"] < 0:
+        raise ValueError("Invalid pending recheck cursor")
+    last_checked = state.get("last_checked_id")
+    if isinstance(last_checked, int) and state["next_candidate"] <= last_checked:
+        gap = last_checked - state["next_candidate"] + 1
+        if gap > 50:
+            raise ValueError("Old checkpoint gap too large to migrate safely")
+        state["pending_missing_ids"] = list(dict.fromkeys(pending + list(range(state["next_candidate"], last_checked + 1))))
+        state["next_candidate"] = last_checked + 1
+        state["missing_streak"] = 0
+        changed = True
+        print(f"Migrated previous missing-ID tail; next forward candidate {state['next_candidate']}")
+    return changed
+
+
+def apply_late_found(state: dict, bid: int) -> dict:
+    """Resolve a previously missing ID; no changes to the forward cursor."""
+    if bid not in state.get("pending_missing_ids", []):
+        raise ValueError("ID was not pending recheck")
+    new = dict(state)
+    new["pending_missing_ids"] = [x for x in state["pending_missing_ids"] if x != bid]
+    new["highest_found_id"] = max(state["highest_found_id"], bid)
+    new["found_count"] += 1
+    new["missing_count"] = max(0, state["missing_count"] - 1)
+    return new
 
 def apply_found(state: dict, bid: int) -> dict:
     if bid != state["next_candidate"]:
@@ -225,10 +269,12 @@ def apply_missing(state: dict, bid: int, missing_threshold: int) -> tuple[dict, 
     new["missing_streak"] += 1
     new["missing_count"] += 1
     new["last_checked_id"] = bid
+    if new["mode"] == "daily":
+        new["pending_missing_ids"] = list(dict.fromkeys(new.get("pending_missing_ids", []) + [bid]))
     stop = new["mode"] == "daily" and new["missing_streak"] >= missing_threshold
     if stop:
-        # Revisit the five unconfirmed slots next time; no permanent skip.
-        new["next_candidate"] = max(new["start_id"], new["highest_found_id"] + 1)
+        # Five misses end THIS run, not all future runs. Keep the durable
+        # forward cursor beyond the gap; revisit misses in a separate pass.
         new["missing_streak"] = 0
     return new, stop
 
@@ -245,6 +291,8 @@ def scan(state_store, fetch: Callable[[int], PageResult], mode: str, start: int,
         print(f"New PRIVATE {mode} checkpoint: starts at {start}")
     else:
         validate_state(state, mode, start, end)
+        if repair_legacy_daily_checkpoint(state):
+            state_store.save(state)
         print(f"Resuming PRIVATE {mode} checkpoint from ID {state['next_candidate']}")
     if state["complete"]:
         print("Requested finite range already complete; no new requests")
@@ -253,6 +301,9 @@ def scan(state_store, fetch: Callable[[int], PageResult], mode: str, start: int,
     state["last_run_utc"] = now_utc()
     state_store.save(state)
     processed = 0
+    # Snapshot only prior-run gaps. Never fetch a just-checked missing ID twice
+    # in the same run, and always prioritize new forward bookings.
+    previous_missing = list(state.get("pending_missing_ids", [])) if mode == "daily" else []
     for idx in range(max_requests):
         candidate = state["next_candidate"]
         if end is not None and candidate > end:
@@ -287,9 +338,40 @@ def scan(state_store, fetch: Callable[[int], PageResult], mode: str, start: int,
             break
         if idx < max_requests - 1 and delay:
             sleep(delay)
+    # Use at most five of the remaining request budget to revisit old gaps.
+    # These checks are independent of the forward stop-after-five rule.
+    if previous_missing and processed < max_requests:
+        cursor = state.get("recheck_cursor", 0) % len(previous_missing)
+        limit = min(5, max_requests - processed, len(previous_missing))
+        for i in range(limit):
+            missing_id = previous_missing[(cursor + i) % len(previous_missing)]
+            if missing_id not in state.get("pending_missing_ids", []):
+                continue
+            try:
+                result = fetch(missing_id)
+            except (ScanError, AccessStopped):
+                print(f"STOP: recheck {missing_id} was not verifiably FOUND or MISSING; saved progress retained", file=sys.stderr)
+                raise
+            if result.kind == "FOUND":
+                if not result.record or str(result.record.get("booking_id")) != str(missing_id):
+                    raise ScanError("Invalid late booking; checkpoint unchanged")
+                state_store.save_record(result.record)
+                state = apply_late_found(state, missing_id)
+                print(f"LATE ID {missing_id}: FOUND; recovered without rewinding forward cursor")
+            elif result.kind == "MISSING":
+                print(f"LATE ID {missing_id}: still MISSING")
+            else:
+                raise ScanError("Unknown missing-ID recheck response")
+            processed += 1
+            if delay and i < limit - 1:
+                sleep(delay)
+            state_store.save(state)
+        state["recheck_cursor"] = (cursor + limit) % max(len(state.get("pending_missing_ids", [])), 1)
+        state_store.save(state)
     print("RUN SUMMARY:",
           f"mode={mode} checked={processed} total_found={state['found_count']}",
-          f"total_missing={state['missing_count']} next={state['next_candidate']}",
+          f"unresolved_missing={state['missing_count']} next={state['next_candidate']}",
+          f"pending_rechecks={len(state.get('pending_missing_ids', []))}",
           f"complete={state['complete']} runs={state['run_count']}")
     print("PRIVATE R2 ONLY. Production archive and public GitHub Pages site not changed.")
     return state
