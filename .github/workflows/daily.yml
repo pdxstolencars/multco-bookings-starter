@@ -39,7 +39,7 @@ jobs:
     # A fresh repository publishes only the empty website preview.
     # Automatic daily collection is disabled until the owner explicitly sets ENABLE_DAILY_COLLECTION=true.
     if: github.event_name != 'schedule' || vars.ENABLE_DAILY_COLLECTION == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: github-pages
     env:
       ARCHIVE_BACKEND: s3
