@@ -56,7 +56,7 @@ function draw() {
     if ((b.charges || []).length) for (const charge of b.charges) text(charges,'span','charge',charge);
     else text(charges,'span','charge','Charges: see official record');
     card.append(main);
-    if (/^https:\/\/apps\.mcso\.us\/PAID\/Home\/Booking(?:\/\d+\/?|\?id=\d+)$/.test(b.source_url || '')) {
+    if (/^https:\/\/apps\.mcso\.us\/PAID\/Home\/Booking(?:\/\d+\/?|\?id=\d+(?:&releaseId=\d+)?)$/.test(b.source_url || '')) {
       const link = text(card,'a','','Official record ↗');
       link.href = b.source_url; link.target = '_blank'; link.rel = 'noopener noreferrer';
     }
