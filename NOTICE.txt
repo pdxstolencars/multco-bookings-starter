@@ -1,0 +1,5 @@
+STARTER ONLY — NOT AN ACTIVE OR VERIFIED LIVE BOOKING SERVICE
+
+No personal booking data is included. Sample records are fictional and only
+used by the unit tests. Full live scraping requires county-policy confirmation,
+site HTML inspection, and legal/privacy review before public launch.

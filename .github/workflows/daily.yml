@@ -1,0 +1,92 @@
+name: Publish Multnomah County Bookings
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Choose preview until the authorized data feed and archive are configured"
+        required: true
+        default: preview
+        type: choice
+        options:
+          - preview
+          - init
+          - collect
+          - export
+          - suppress
+      booking_id:
+        description: "Numeric booking ID (suppress only)"
+        required: false
+        type: string
+  schedule:
+    - cron: '45 23 * * *'  # 11:45 PM Pacific daily (GitHub may start runs late)
+      timezone: 'America/Los_Angeles'  # Automatically handles PST/PDT
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: booking-archive-and-pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # A fresh repository publishes only the empty website preview.
+    # Automatic daily collection is disabled until the owner explicitly sets ENABLE_DAILY_COLLECTION=true.
+    if: github.event_name != 'schedule' || vars.ENABLE_DAILY_COLLECTION == 'true'
+    runs-on: ubuntu-latest
+    environment: github-pages
+    env:
+      ARCHIVE_BACKEND: s3
+      ARCHIVE_RETENTION_DAYS: '730'
+      ARCHIVE_BUCKET: ${{ secrets.ARCHIVE_BUCKET }}
+      ARCHIVE_ENDPOINT_URL: ${{ secrets.ARCHIVE_ENDPOINT_URL }}
+      ARCHIVE_ACCESS_KEY_ID: ${{ secrets.ARCHIVE_ACCESS_KEY_ID }}
+      ARCHIVE_SECRET_ACCESS_KEY: ${{ secrets.ARCHIVE_SECRET_ACCESS_KEY }}
+      SCRAPER_CONTACT: ${{ secrets.SCRAPER_CONTACT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies and run offline tests
+        run: |
+          python -m pip install -r requirements.txt pytest
+          pytest -q
+      - name: Block live actions until the feed and private storage are explicitly enabled
+        if: github.event_name == 'workflow_dispatch' && inputs.action != 'preview' && vars.ENABLE_DAILY_COLLECTION != 'true'
+        run: |
+          echo 'Live collection/archive not enabled. First complete MCSO permissions, live parser testing and private S3 storage setup.'
+          exit 1
+      - name: Initialize private archive once
+        if: github.event_name == 'workflow_dispatch' && inputs.action == 'init' && vars.ENABLE_DAILY_COLLECTION == 'true'
+        run: python archive_store.py init
+      - name: Install browser for the live collector
+        if: vars.ENABLE_DAILY_COLLECTION == 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.action == 'collect'))
+        run: python -m playwright install --with-deps chromium
+      - name: Collect verified bookings and export recent plus archive views
+        if: vars.ENABLE_DAILY_COLLECTION == 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.action == 'collect'))
+        run: python collector.py
+      - name: Suppress a booking and republish
+        if: vars.ENABLE_DAILY_COLLECTION == 'true' && github.event_name == 'workflow_dispatch' && inputs.action == 'suppress'
+        env:
+          BOOKING_ID: ${{ inputs.booking_id }}
+        run: python archive_store.py suppress "$BOOKING_ID"
+      - name: Export previously collected archive without scraping
+        if: vars.ENABLE_DAILY_COLLECTION == 'true' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.action == 'preview' || inputs.action == 'export')))
+        run: python archive_store.py export
+      - name: Configure GitHub Pages
+        if: github.event_name != 'workflow_dispatch' || inputs.action != 'init'
+        uses: actions/configure-pages@v5
+      - name: Upload static website
+        if: github.event_name != 'workflow_dispatch' || inputs.action != 'init'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - name: Publish site to GitHub Pages
+        if: github.event_name != 'workflow_dispatch' || inputs.action != 'init'
+        uses: actions/deploy-pages@v4

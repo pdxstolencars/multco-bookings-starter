@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow,noarchive">
+  <meta name="description" content="Unofficial Multnomah County booking-record search. Booking is not a conviction; verify records with the Sheriff's Office.">
+  <title>Multnomah County Bookings — Recent &amp; Archive</title>
+  <link rel="stylesheet" href="./style.css">
+  <script src="./app.js" defer></script>
+</head>
+<body>
+  <header class="masthead"><div class="shell">
+    <div class="eyebrow">INDEPENDENT PUBLIC-RECORDS VIEWER · OREGON</div>
+    <h1>Multnomah County <span>Bookings</span></h1>
+    <p>View recent jail bookings or search the archive compiled from verified public Sheriff's Office records. Not affiliated with Multnomah County or any law-enforcement agency.</p>
+    <div class="source"><a href="https://apps.mcso.us/PAID" target="_blank" rel="noopener noreferrer">Official MCSO booking search ↗</a></div>
+  </div></header>
+  <main class="shell">
+    <section class="notice" aria-label="Important information"><strong>A booking is not a conviction.</strong> Charges are allegations that can change or be dismissed. Older records may no longer appear in official searches, and inclusion here does not mean someone is currently in custody. Always verify with MCSO. No booking photos are displayed.</section>
+
+    <section class="toolbar" aria-label="Booking search">
+      <div class="tabs" role="group" aria-label="Select record view">
+        <button id="recent-tab" class="tab active" type="button" aria-pressed="true">Recent bookings</button>
+        <button id="archive-tab" class="tab" type="button" aria-pressed="false">Search archive</button>
+      </div>
+      <div class="stats">
+        <div class="stat"><span id="count">—</span><small id="count-label">Matching bookings</small></div>
+        <div class="stat"><span id="updated">Not updated</span><small>Last successful collection (Pacific)</small></div>
+        <div class="stat"><span id="coverage">—</span><small>Archive collection began</small></div>
+      </div>
+      <div class="inputs">
+        <label class="search-field">Search by name or charge<input id="query" type="search" placeholder="Enter a name or charge…" autocomplete="off"></label>
+        <label class="date-field">From date<input id="start-day" type="date"></label>
+        <label class="date-field">To date<input id="end-day" type="date"></label>
+        <button id="clear" type="button">Clear filters</button>
+      </div>
+      <p id="mode-hint" class="mode-hint">Showing bookings collected in the last seven days, newest first.</p>
+    </section>
+    <div id="status" class="status" role="status" aria-live="polite">Loading verified records…</div>
+    <div id="results" class="results"></div>
+    <nav id="pager" class="pager" aria-label="Result pages" hidden>
+      <button type="button" id="prev">Previous</button>
+      <span id="page-indicator">Page 1</span>
+      <button type="button" id="next">Next</button>
+    </nav>
+    <footer>
+      <p>Archive coverage begins only when automated collection successfully starts. Missing records do not establish that someone was never arrested. Dates represent booking dates, not case outcomes. This website omits booking photos, dates of birth, personal addresses, and demographic details. The archive is subject to a retention and correction policy.</p>
+      <p>Corrections and removal contact information will be provided before live records are enabled. Verify records using the <a href="https://apps.mcso.us/PAID" target="_blank" rel="noopener noreferrer">official MCSO database</a>.</p>
+    </footer>
+  </main>
+</body>
+</html>
