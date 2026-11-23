@@ -368,9 +368,11 @@ def apply_missing(state: dict, bid: int, missing_threshold: int) -> tuple[dict, 
 
 def scan(state_store, fetch: Callable[[int], PageResult], mode: str, start: int, end: int | None,
          max_requests: int = 20, missing_threshold: int = 5, delay: float = 2.0,
-         sleep: Callable[[float], None] = time.sleep) -> dict:
-    if not (1 <= max_requests <= 500) or not (1 <= missing_threshold <= 50) or delay < 0:
+         sleep: Callable[[float], None] = time.sleep, gap_lookahead: int = 0) -> dict:
+    if not (1 <= max_requests <= 500) or not (1 <= missing_threshold <= 50) or delay < 0 or not (0 <= gap_lookahead <= 200):
         raise ValueError("Invalid scan safety limits")
+    if gap_lookahead and (mode != "daily" or gap_lookahead <= missing_threshold):
+        raise ValueError("Gap lookahead must exceed missing threshold and requires daily mode")
     state = state_store.load()
     if state is None:
         state = new_state(mode, start, end)
@@ -386,6 +388,23 @@ def scan(state_store, fetch: Callable[[int], PageResult], mode: str, start: int,
         if checkpoint_repaired or charge_queue_prepared:
             state_store.save(state)
         print(f"Resuming PRIVATE {mode} checkpoint from ID {state['next_candidate']}")
+    # Previous hourly runs advanced past speculative not-found IDs. For robust
+    # lookahead, those IDs were never confirmed as valid bookings, so restart
+    # the forward scan immediately after the highest *confirmed* booking.
+    # This is a migration of the cursor only, not a deletion of any records.
+    if mode == "daily" and gap_lookahead:
+        confirmed_frontier = max(start, state["highest_found_id"] + 1)
+        if state["next_candidate"] > confirmed_frontier:
+            distance = state["next_candidate"] - confirmed_frontier
+            if distance > 10000:
+                raise ValueError("Excessive speculative cursor drift; manual checkpoint review required")
+            pending = set(state.get("pending_missing_ids", []))
+            pending.update(range(confirmed_frontier, state["next_candidate"]))
+            state["pending_missing_ids"] = sorted(pending)
+            state["next_candidate"] = confirmed_frontier
+            state["missing_streak"] = 0
+            state_store.save(state)
+            print(f"Corrected speculative cursor: revisiting IDs from {confirmed_frontier}")
     if state["complete"]:
         print("Requested finite range already complete; no new requests")
         return state
@@ -442,14 +461,19 @@ def scan(state_store, fetch: Callable[[int], PageResult], mode: str, start: int,
     # Snapshot only prior-run gaps. Never fetch a just-checked missing ID twice
     # in the same run, and always prioritize new forward bookings.
     previous_missing = list(state.get("pending_missing_ids", [])) if mode == "daily" else []
+    forward_seen: set[int] = set()
     for idx in range(max_requests - processed):
         candidate = state["next_candidate"]
+        if mode == "daily" and gap_lookahead and candidate >= state["highest_found_id"] + 1 + gap_lookahead:
+            print(f"Safety lookahead exhausted: checked {gap_lookahead} IDs past last confirmed booking {state['highest_found_id']}")
+            break
         if end is not None and candidate > end:
             state["complete"] = True
             state_store.save(state)
             break
         try:
             result = fetch(candidate)
+            forward_seen.add(candidate)
         except (ScanError, AccessStopped):
             # Leave next_candidate untouched on all unexpected responses.
             print(f"STOP: page {candidate} was not verifiably FOUND or MISSING; checkpoint unchanged", file=sys.stderr)
@@ -459,10 +483,18 @@ def scan(state_store, fetch: Callable[[int], PageResult], mode: str, start: int,
                 raise ScanError("Invalid validated record; checkpoint unchanged")
             # Write the full record BEFORE advancing checkpoint; replay is safe.
             state_store.save_record(result.record)
+            already_missing = candidate in state.get("pending_missing_ids", [])
             state = apply_found(state, candidate)
+            if already_missing:
+                state["pending_missing_ids"] = [n for n in state["pending_missing_ids"] if n != candidate]
+                state["missing_count"] = max(0, state["missing_count"] - 1)
             queue_unposted_charges(state, candidate, result.record)
         elif result.kind == "MISSING":
+            already_missing = candidate in state.get("pending_missing_ids", [])
             state, stop = apply_missing(state, candidate, missing_threshold)
+            if already_missing:
+                # A repeated negative response is not a *new* missing record.
+                state["missing_count"] -= 1
         else:
             raise ScanError("Unknown result; checkpoint unchanged")
         state_store.save(state)
@@ -472,9 +504,11 @@ def scan(state_store, fetch: Callable[[int], PageResult], mode: str, start: int,
             state["complete"] = True
             state_store.save(state)
             break
-        if result.kind == "MISSING" and stop:
+        if result.kind == "MISSING" and stop and not gap_lookahead:
             print(f"Daily stopping rule met ({missing_threshold} consecutive confirmed missing IDs)")
             break
+        if result.kind == "MISSING" and stop and gap_lookahead:
+            print(f"Five-missing warning at {candidate}; using {gap_lookahead}-ID safety lookahead", flush=True)
         if idx < max_requests - 1 and delay:
             sleep(delay)
     # Use at most five of the remaining request budget to revisit old gaps.
@@ -484,7 +518,7 @@ def scan(state_store, fetch: Callable[[int], PageResult], mode: str, start: int,
         limit = min(5, max_requests - processed, len(previous_missing))
         for i in range(limit):
             missing_id = previous_missing[(cursor + i) % len(previous_missing)]
-            if missing_id not in state.get("pending_missing_ids", []):
+            if missing_id not in state.get("pending_missing_ids", []) or missing_id in forward_seen:
                 continue
             try:
                 result = fetch(missing_id)
@@ -508,6 +542,14 @@ def scan(state_store, fetch: Callable[[int], PageResult], mode: str, start: int,
             state_store.save(state)
         state["recheck_cursor"] = (cursor + limit) % max(len(state.get("pending_missing_ids", [])), 1)
         state_store.save(state)
+    if mode == "daily" and gap_lookahead:
+        # Do not let a speculative negative tail become a permanent checkpoint.
+        # Each run must test the uncertain end again, since MCSO can publish
+        # those booking pages later.
+        state["next_candidate"] = max(start, state["highest_found_id"] + 1)
+        state["missing_streak"] = 0
+        state_store.save(state)
+        print(f"Unverified tail retained for next run; confirmed frontier {state['next_candidate']}")
     print("RUN SUMMARY:",
           f"mode={mode} checked={processed} total_found={state['found_count']}",
           f"unresolved_missing={state['missing_count']} next={state['next_candidate']}",
@@ -575,6 +617,8 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=1658164, help="Last previously known ID, only for daily")
     ap.add_argument("--max-requests", type=int, default=20)
     ap.add_argument("--missing-threshold", type=int, default=5)
+    ap.add_argument("--gap-lookahead", type=int, default=0,
+                    help="For daily mode: revisit an uncertain tail and check up to N IDs after the latest confirmed booking; use 30 for hourly collection")
     ap.add_argument("--delay", type=float, default=2.0)
     args = ap.parse_args()
     if args.mode == "range":
@@ -587,7 +631,8 @@ def main() -> int:
         store = PrivateStore(args.mode)
         fetch, close = live_fetcher()
         try:
-            scan(store, fetch, args.mode, start, end, args.max_requests, args.missing_threshold, args.delay)
+            scan(store, fetch, args.mode, start, end, args.max_requests, args.missing_threshold, args.delay,
+                 gap_lookahead=args.gap_lookahead)
         finally:
             close()
         return 0
