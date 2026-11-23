@@ -6,12 +6,13 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: "Choose preview until the authorized data feed and archive are configured"
+        description: "Use probe for a read-only live test; do not enable collect until the result is verified"
         required: true
         default: preview
         type: choice
         options:
           - preview
+          - probe
           - init
           - collect
           - export
@@ -58,13 +59,19 @@ jobs:
           python -m pip install -r requirements.txt pytest
           python -m pytest -q
       - name: Block live actions until the feed and private storage are explicitly enabled
-        if: github.event_name == 'workflow_dispatch' && inputs.action != 'preview' && inputs.action != 'init' && vars.ENABLE_DAILY_COLLECTION != 'true'
+        if: github.event_name == 'workflow_dispatch' && inputs.action != 'preview' && inputs.action != 'init' && inputs.action != 'probe' && vars.ENABLE_DAILY_COLLECTION != 'true'
         run: |
           echo 'Live collection/archive not enabled. First complete MCSO permissions, live parser testing and private S3 storage setup.'
           exit 1
       - name: Initialize private archive once
         if: github.event_name == 'workflow_dispatch' && inputs.action == 'init'
         run: python archive_store.py init
+      - name: Install Chromium for one-time public-search test
+        if: github.event_name == 'workflow_dispatch' && inputs.action == 'probe'
+        run: python -m playwright install --with-deps chromium
+      - name: Probe MCSO search and three details without writing or publishing
+        if: github.event_name == 'workflow_dispatch' && inputs.action == 'probe'
+        run: python collector.py --probe
       - name: Install browser for the live collector
         if: vars.ENABLE_DAILY_COLLECTION == 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.action == 'collect'))
         run: python -m playwright install --with-deps chromium
@@ -80,13 +87,13 @@ jobs:
         if: vars.ENABLE_DAILY_COLLECTION == 'true' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.action == 'preview' || inputs.action == 'export')))
         run: python archive_store.py export
       - name: Configure GitHub Pages
-        if: github.event_name != 'workflow_dispatch' || inputs.action != 'init'
+        if: github.event_name != 'workflow_dispatch' || (inputs.action != 'init' && inputs.action != 'probe')
         uses: actions/configure-pages@v5
       - name: Upload static website
-        if: github.event_name != 'workflow_dispatch' || inputs.action != 'init'
+        if: github.event_name != 'workflow_dispatch' || (inputs.action != 'init' && inputs.action != 'probe')
         uses: actions/upload-pages-artifact@v4
         with:
           path: site
       - name: Publish site to GitHub Pages
-        if: github.event_name != 'workflow_dispatch' || inputs.action != 'init'
+        if: github.event_name != 'workflow_dispatch' || (inputs.action != 'init' && inputs.action != 'probe')
         uses: actions/deploy-pages@v4
