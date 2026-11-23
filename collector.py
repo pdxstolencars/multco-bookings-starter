@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import ssl
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,7 @@ from urllib.parse import urljoin, urlsplit, parse_qsl
 from urllib.robotparser import RobotFileParser
 
 import requests
+from requests.adapters import HTTPAdapter
 from bs4 import BeautifulSoup
 from archive_store import ArchiveStore, merge_state, export_site
 
@@ -182,14 +184,34 @@ def parse_booking_html(html: str, url: str) -> dict | None:
     }
 
 
+class CountyTLSAdapter(HTTPAdapter):
+    """Use modern ECDHE TLS cipher suites for the county host only.
+
+    Some servers offer weak finite-field DHE parameters that OpenSSL rejects
+    with DH_KEY_TOO_SMALL. Offering ECDHE instead avoids selecting weak DHE
+    without lowering OpenSSL security requirements, ignoring certificates,
+    or affecting unrelated HTTPS connections. Fail closed if no safe cipher
+    can be negotiated.
+    """
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        context = ssl.create_default_context()  # CA + hostname validation ON
+        context.set_ciphers("ECDHE:!aNULL:!eNULL")
+        pool_kwargs["ssl_context"] = context
+        super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+
+
 def allowed_to_scrape(user_agent: str, timeout: int = 20) -> bool:
     """Fail closed if robots.txt cannot be verified. A 404 means no robots file.
 
-    robots permission is not legal permission; seek any required county approval.
+    robots permission is not legal permission. This function does not
+    circumvent human-verification challenges or restrictions on scraping.
     """
     url = "https://apps.mcso.us/robots.txt"
     try:
-        response = requests.get(url, timeout=timeout, headers={"User-Agent": user_agent})
+        with requests.Session() as session:
+            # Apply the cipher preference ONLY to MCSO; do not disable TLS checks.
+            session.mount("https://apps.mcso.us/", CountyTLSAdapter())
+            response = session.get(url, timeout=timeout, headers={"User-Agent": user_agent})
         if response.status_code == 404:
             return True
         if response.status_code != 200:
