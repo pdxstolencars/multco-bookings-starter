@@ -63,6 +63,11 @@ class AccessStopped(ScanError):
     pass
 
 
+class TransientServerError(ScanError):
+    """Temporary server failure; retry a few times without advancing checkpoint."""
+    pass
+
+
 @dataclass(frozen=True)
 class PageResult:
     kind: str  # FOUND / MISSING
@@ -80,8 +85,8 @@ def classify_page(status: int | None, html: str, booking_id: int, final_url: str
         raise AccessStopped("Unexpected redirect or URL change")
     if status in (403, 429):
         raise AccessStopped("MCSO denied or rate-limited the request")
-    if status is None or status >= 500:
-        raise ScanError("MCSO server response unavailable")
+    if status is None:
+        raise TransientServerError("MCSO server response unavailable (no HTTP status)")
 
     soup = BeautifulSoup(html, "html.parser")
     main = soup.select_one("#right .page") or soup.select_one("#right") or soup.body or soup
@@ -89,6 +94,8 @@ def classify_page(status: int | None, html: str, booking_id: int, final_url: str
     if (soup.select_one('[class*="captcha" i], [id*="captcha" i], iframe[src*="recaptcha" i], iframe[src*="hcaptcha" i], iframe[src*="turnstile" i]')
             or any(p in visible for p in CHALLENGE_PHRASES)):
         raise AccessStopped("MCSO returned a verification or access-block page")
+    if status >= 500:
+        raise TransientServerError(f"MCSO server returned HTTP {status}")
     if any(phrase in visible for phrase in NOT_FOUND_PHRASES):
         if status not in (200, 404):
             raise ScanError("Unexpected status on missing-booking response")
@@ -288,6 +295,26 @@ def scan(state_store, fetch: Callable[[int], PageResult], mode: str, start: int,
     return state
 
 
+def retry_transient_server_error(operation: Callable[[], PageResult], booking_id: int,
+                                 backoffs: tuple[float, ...] = (10.0, 30.0),
+                                 sleep: Callable[[float], None] = time.sleep) -> PageResult:
+    """Retry only temporary 5xx/absent-status responses. Never retry access blocks.
+
+    If all attempts fail, the caller stops on this ID and preserves its checkpoint.
+    """
+    for attempt in range(len(backoffs) + 1):
+        try:
+            return operation()
+        except TransientServerError as exc:
+            if attempt == len(backoffs):
+                raise
+            delay = backoffs[attempt]
+            print(f"Temporary server response for ID {booking_id}: {exc}; "
+                  f"retry {attempt + 1}/{len(backoffs)} after {delay:g}s", flush=True)
+            sleep(delay)
+    raise AssertionError("unreachable")
+
+
 def live_fetcher():
     from playwright.sync_api import sync_playwright
     playwright = sync_playwright().start()
@@ -301,11 +328,13 @@ def live_fetcher():
     page = ctx.new_page()
     def fetch(booking_id: int) -> PageResult:
         url = candidate_url(booking_id)
-        try:
+        def once() -> PageResult:
             response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
             if response is None:
-                raise ScanError("MCSO returned no HTTP response")
+                raise TransientServerError("MCSO server returned no HTTP response")
             return classify_page(response.status, page.content(), booking_id, page.url)
+        try:
+            return retry_transient_server_error(once, booking_id)
         except (ScanError, AccessStopped):
             raise
         except Exception as exc:
