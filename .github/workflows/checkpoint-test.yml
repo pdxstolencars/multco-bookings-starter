@@ -1,0 +1,31 @@
+name: Booking ID Checkpoint Test (offline)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: multco-private-checkpoint-demo
+  cancel-in-progress: false
+
+jobs:
+  checkpoint-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: python -m pip install boto3 pytest
+      - name: Run offline checkpoint tests
+        run: python -m pytest -q tests/test_checkpoint_test.py
+      - name: Simulate five-missing-ID stop and resume; save checkpoint in R2
+        env:
+          ARCHIVE_BUCKET: ${{ secrets.ARCHIVE_BUCKET }}
+          ARCHIVE_ENDPOINT_URL: ${{ secrets.ARCHIVE_ENDPOINT_URL }}
+          ARCHIVE_ACCESS_KEY_ID: ${{ secrets.ARCHIVE_ACCESS_KEY_ID }}
+          ARCHIVE_SECRET_ACCESS_KEY: ${{ secrets.ARCHIVE_SECRET_ACCESS_KEY }}
+        run: python checkpoint_test.py --backend s3 --seed 1658164 --missing-threshold 5 --max-requests 50
