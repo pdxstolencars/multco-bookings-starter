@@ -58,12 +58,12 @@ jobs:
           python -m pip install -r requirements.txt pytest
           python -m pytest -q
       - name: Block live actions until the feed and private storage are explicitly enabled
-       if: github.event_name == 'workflow_dispatch' && inputs.action != 'preview' && inputs.action != 'init' && vars.ENABLE_DAILY_COLLECTION != 'true'
+        if: github.event_name == 'workflow_dispatch' && inputs.action != 'preview' && inputs.action != 'init' && vars.ENABLE_DAILY_COLLECTION != 'true'
         run: |
           echo 'Live collection/archive not enabled. First complete MCSO permissions, live parser testing and private S3 storage setup.'
           exit 1
       - name: Initialize private archive once
-       if: github.event_name == 'workflow_dispatch' && inputs.action == 'init'
+        if: github.event_name == 'workflow_dispatch' && inputs.action == 'init'
         run: python archive_store.py init
       - name: Install browser for the live collector
         if: vars.ENABLE_DAILY_COLLECTION == 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.action == 'collect'))
