@@ -14,6 +14,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urljoin
 from urllib.robotparser import RobotFileParser
 
 import requests
@@ -23,7 +24,7 @@ from archive_store import ArchiveStore, merge_state, export_site
 BASE = "https://apps.mcso.us/PAID"
 MAX_BOOKINGS_PER_RUN = 550
 LOG = logging.getLogger("multco_bookings")
-URL_RE = re.compile(r"https://apps\.mcso\.us/PAID/Home/Booking/(\d+)/?$", re.I)
+URL_RE = re.compile(r"https://apps\.mcso\.us/PAID/Home/Booking(?:/(\d+)/?|\?id=(\d+))$", re.I)
 
 LABELS = {
     "name": {"name", "full name", "person name", "person in custody", "inmate name", "booked name"},
@@ -127,7 +128,7 @@ def parse_booking_html(html: str, url: str) -> dict | None:
     if re.search(r"\bjuvenile\b|\byouth custody\b", text, flags=re.I):
         return None
     return {
-        "booking_id": m.group(1),
+        "booking_id": m.group(1) or m.group(2),
         "name": name,
         "booking_date": booking_date,
         "charges": charges[:20],
@@ -152,26 +153,35 @@ def allowed_to_scrape(user_agent: str, timeout: int = 20) -> bool:
             return False
         robots = RobotFileParser()
         robots.parse(response.text.splitlines())
-        return robots.can_fetch(user_agent, BASE) and robots.can_fetch(user_agent, BASE + "/Home/Booking/1")
+        return robots.can_fetch(user_agent, BASE) and robots.can_fetch(user_agent, BASE + "/Home/Booking?id=1")
     except requests.RequestException as exc:
         LOG.error("Cannot check robots rules: %s", exc)
         return False
 
 
 def get_page_links(page) -> list[str]:
-    links = page.locator('a[href*="/Home/Booking/"]')
+    """Extract only official detail links, including the observed ?id=123 form.
+
+    The MCSO results page is authoritative; numeric IDs are not guessed,
+    incremented, or scraped by sequential enumeration.
+    """
+    links = page.locator('a[href*="Booking"]')
     urls: set[str] = set()
     for i in range(links.count()):
-        href = links.nth(i).get_attribute("href") or ""
+        href = (links.nth(i).get_attribute("href") or "").strip()
         if href.startswith("/PAID/"):
-            href = "https://apps.mcso.us" + href
+            absolute = "https://apps.mcso.us" + href
         elif href.startswith("/Home/"):
-            href = BASE + href
+            absolute = BASE + href
         elif href.startswith("Home/"):
-            href = BASE + "/" + href
-        if URL_RE.fullmatch(href):
-            urls.add(href)
-    return sorted(urls)
+            absolute = BASE + "/" + href
+        else:
+            absolute = urljoin(page.url, href)
+        m = URL_RE.fullmatch(absolute)
+        if m:
+            # Normalize legacy paths to the confirmed 2026 address format.
+            urls.add(f"{BASE}/Home/Booking?id={m.group(1) or m.group(2)}")
+    return sorted(urls, key=lambda u: int(u.rsplit('=', 1)[-1]))
 
 
 def gather_links(page) -> list[str]:
@@ -238,7 +248,12 @@ def collect(contact: str = "", site: Path = Path("site")) -> int:
             context = browser.new_context(user_agent=ua)
             page = context.new_page()
             links = gather_links(page)
-            LOG.info("Found %d official booking URLs", len(links))
+            known = {str(item.get("booking_id")) for item in previous.get("bookings", [])}
+            ids = [link.rsplit("=", 1)[-1] for link in links]
+            LOG.info("Official recent results: %d links (%d new booking IDs, %d previously collected)",
+                     len(links), sum(bid not in known for bid in ids), sum(bid in known for bid in ids))
+            # We do not probe missing consecutive IDs: unpublished/invalid ID values
+            # must never be assumed to represent accessible booking records.
             records: list[dict] = []
             failures = 0
             for n, link in enumerate(links, 1):
@@ -273,7 +288,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--site", type=Path, default=Path("site"))
     parser.add_argument("--test-html", type=Path, help="Test only: parse saved, non-real HTML fixture")
-    parser.add_argument("--test-url", default="https://apps.mcso.us/PAID/Home/Booking/9999999")
+    parser.add_argument("--test-url", default="https://apps.mcso.us/PAID/Home/Booking?id=9999999")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     try:

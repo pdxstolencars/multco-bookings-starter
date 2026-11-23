@@ -16,7 +16,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 PUBLIC_FIELDS = ("booking_id", "name", "booking_date", "charges", "facility", "source_url")
-SOURCE_PREFIX = "https://apps.mcso.us/PAID/Home/Booking/"
+SOURCE_PREFIX = "https://apps.mcso.us/PAID/Home/Booking?id="
+LEGACY_SOURCE_PREFIX = "https://apps.mcso.us/PAID/Home/Booking/"
 DEFAULT_RETENTION_DAYS = 730  # Two years; 0 disables age-based expiration after legal review.
 
 
@@ -48,7 +49,10 @@ def clean_record(item: dict, now: datetime, max_age: int) -> dict | None:
         return None
     # Do not trust arbitrary external URLs, even when a record is loaded from storage.
     expected_url = SOURCE_PREFIX + bid
-    if item.get("source_url", "").rstrip("/") != expected_url:
+    supplied_url = item.get("source_url", "")
+    if not isinstance(supplied_url, str) or supplied_url.rstrip("/") not in {
+        expected_url, LEGACY_SOURCE_PREFIX + bid
+    }:
         return None
     charges = item.get("charges", [])
     if not isinstance(charges, list):
