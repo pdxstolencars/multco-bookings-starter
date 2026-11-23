@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="robots" content="noindex,nofollow,noarchive">
   <meta name="description" content="Unofficial Multnomah County booking-record search. Booking is not a conviction; verify records with the Sheriff's Office.">
-  <title>Multnomah County Bookings — Recent &amp; Archive</title>
+  <title>Multnomah County Bookings | A Project of PDX Stolen Cars</title>
   <link rel="stylesheet" href="./style.css">
   <script src="./app.js" defer></script>
 </head>
@@ -13,6 +13,7 @@
   <header class="masthead"><div class="shell">
     <div class="eyebrow">INDEPENDENT PUBLIC-RECORDS VIEWER · OREGON</div>
     <h1>Multnomah County <span>Bookings</span></h1>
+    <div class="project-credit">A project of <a href="https://pdxstolencars.org/" target="_blank" rel="noopener noreferrer">PDX Stolen Cars / pdxstolencars.org</a></div>
     <p>View recent jail bookings or search the archive compiled from verified public Sheriff's Office records. Not affiliated with Multnomah County or any law-enforcement agency.</p>
     <div class="source"><a href="https://apps.mcso.us/PAID" target="_blank" rel="noopener noreferrer">Official MCSO booking search ↗</a></div>
   </div></header>
@@ -26,11 +27,11 @@
       </div>
       <div class="stats">
         <div class="stat"><span id="count">—</span><small id="count-label">Matching bookings</small></div>
-        <div class="stat"><span id="updated">Not updated</span><small>Last successful collection (Pacific)</small></div>
+        <div class="stat"><span id="updated">Not updated</span><small>Last archive scan (Pacific)</small></div>
         <div class="stat"><span id="coverage">—</span><small>Archive collection began</small></div>
       </div>
       <div class="inputs">
-        <label class="search-field">Search by name or charge<input id="query" type="search" placeholder="Enter a name or charge…" autocomplete="off"></label>
+        <label class="search-field">Search name, charge, case or booking number<input id="query" type="search" placeholder="Name, charge, booking ID, case number…" autocomplete="off"></label>
         <label class="date-field">From date<input id="start-day" type="date"></label>
         <label class="date-field">To date<input id="end-day" type="date"></label>
         <button id="clear" type="button">Clear filters</button>
@@ -45,8 +46,9 @@
       <button type="button" id="next">Next</button>
     </nav>
     <footer>
-      <p>Archive coverage begins only when automated collection successfully starts. Missing records do not establish that someone was never arrested. Dates represent booking dates, not case outcomes. This website omits booking photos, dates of birth, personal addresses, and demographic details. The archive is subject to a retention and correction policy.</p>
-      <p>Corrections and removal contact information will be provided before live records are enabled. Verify records using the <a href="https://apps.mcso.us/PAID" target="_blank" rel="noopener noreferrer">official MCSO database</a>.</p>
+      <p>Archive coverage begins only when automated collection successfully starts. Missing records do not establish that someone was never arrested. Dates represent booking dates, not case outcomes. The site displays the available booking-page fields, including demographics, case information and charges. It does not add unpublished dates of birth, home addresses or booking photos. The archive is subject to a retention and correction policy.</p>
+      <p>For questions, corrections, or record removal, visit <a href="https://pdxstolencars.org/" target="_blank" rel="noopener noreferrer">PDX Stolen Cars</a>. Verify records using the <a href="https://apps.mcso.us/PAID" target="_blank" rel="noopener noreferrer">official MCSO database</a>.</p>
+      <p class="project-footer">A project of <a href="https://pdxstolencars.org/" target="_blank" rel="noopener noreferrer">PDX Stolen Cars / pdxstolencars.org</a></p>
     </footer>
   </main>
 </body>
