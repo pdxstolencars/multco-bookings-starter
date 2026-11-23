@@ -1,0 +1,67 @@
+name: Authorized MCSO Sequential Booking Test (private)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_type:
+        description: 'Range test 1658100-1658163, or a daily checkpoint run'
+        required: true
+        type: choice
+        default: range_test
+        options:
+          - range_test
+          - daily
+      max_requests:
+        description: 'Maximum booking pages to check in this run (1-500)'
+        required: true
+        default: '20'
+        type: string
+  schedule:
+    - cron: '45 23 * * *'
+      timezone: 'America/Los_Angeles'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: multco-private-sequential-collector
+  cancel-in-progress: false
+
+jobs:
+  sequential-private:
+    # Scheduled scanning stays off until explicitly enabled in Settings ->
+    # Secrets and variables -> Actions -> Variables.
+    if: github.event_name != 'schedule' || vars.ENABLE_SEQUENTIAL_COLLECTION == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      ARCHIVE_BUCKET: ${{ secrets.ARCHIVE_BUCKET }}
+      ARCHIVE_ENDPOINT_URL: ${{ secrets.ARCHIVE_ENDPOINT_URL }}
+      ARCHIVE_ACCESS_KEY_ID: ${{ secrets.ARCHIVE_ACCESS_KEY_ID }}
+      ARCHIVE_SECRET_ACCESS_KEY: ${{ secrets.ARCHIVE_SECRET_ACCESS_KEY }}
+      SCRAPER_CONTACT: ${{ secrets.SCRAPER_CONTACT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies and run offline safety tests
+        run: |
+          python -m pip install -r requirements.txt pytest
+          python -m pytest -q tests/test_sequential_live.py
+      - name: Install Chromium
+        run: python -m playwright install --with-deps chromium
+      - name: Run PRIVATE authorized sequential range or daily checkpoint scan
+        env:
+          RUN_TYPE: ${{ inputs.run_type }}
+          MAX_REQUESTS: ${{ inputs.max_requests }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "schedule" || "$RUN_TYPE" == "daily" ]]; then
+            python sequential_live.py --mode daily --seed 1658164 --missing-threshold 5 --max-requests "${MAX_REQUESTS:-100}" --delay 2.0
+          elif [[ "$RUN_TYPE" == "range_test" ]]; then
+            python sequential_live.py --mode range --start 1658100 --end 1658163 --max-requests "${MAX_REQUESTS:-20}" --delay 2.0
+          else
+            echo 'Invalid run type'; exit 1
+          fi
