@@ -84,7 +84,7 @@ jobs:
         uses: actions/configure-pages@v5
       - name: Upload static website
         if: github.event_name != 'workflow_dispatch' || inputs.action != 'init'
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v4
         with:
           path: site
       - name: Publish site to GitHub Pages
