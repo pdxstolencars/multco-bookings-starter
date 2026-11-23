@@ -19,8 +19,8 @@ on:
         required: false
         type: string
   schedule:
-    - cron: '45 23 * * *'
-      timezone: 'America/Los_Angeles'
+  - cron: '45 * * * *'
+    timezone: 'America/Los_Angeles'
 
 permissions:
   contents: read
