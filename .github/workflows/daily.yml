@@ -32,14 +32,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish:
+  build:
     # Only the explicitly enabled source collector runs on a timer.
     if: github.event_name != 'schedule' || vars.ENABLE_SEQUENTIAL_COLLECTION == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 55
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     env:
       ARCHIVE_BUCKET: ${{ secrets.ARCHIVE_BUCKET }}
       ARCHIVE_ENDPOINT_URL: ${{ secrets.ARCHIVE_ENDPOINT_URL }}
@@ -47,40 +44,77 @@ jobs:
       ARCHIVE_SECRET_ACCESS_KEY: ${{ secrets.ARCHIVE_SECRET_ACCESS_KEY }}
       SCRAPER_CONTACT: ${{ secrets.SCRAPER_CONTACT }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
       - name: Install dependencies and run offline tests
         run: |
           python -m pip install -r requirements.txt pytest
           python -m pytest -q
+
       - name: Refuse manual collection until daily collection is enabled
         if: github.event_name == 'workflow_dispatch' && inputs.action == 'collect' && vars.ENABLE_SEQUENTIAL_COLLECTION != 'true'
         run: |
           echo 'Set Actions variable ENABLE_SEQUENTIAL_COLLECTION=true before starting live collection.'
           exit 1
+
       - name: Install Chromium for scheduled/manual collection
         if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.action == 'collect')
         run: python -m playwright install --with-deps chromium
+
       - name: Collect sequential booking pages hourly at :45 Pacific
         if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.action == 'collect')
         run: |
           python sequential_live.py --mode daily --seed 1658164 --missing-threshold 5 --gap-lookahead 30 --max-requests 200 --delay 2.0
+
       - name: Suppress one booking ID in future public exports
         if: github.event_name == 'workflow_dispatch' && inputs.action == 'suppress'
         env:
           BOOKING_ID: ${{ inputs.booking_id }}
         run: python export_full_archive.py --site site --suppress-booking-id "$BOOKING_ID"
+
       - name: Export all verified full-detail bookings for the website
         if: github.event_name != 'workflow_dispatch' || inputs.action != 'suppress'
         run: python export_full_archive.py --site site
+
+      - name: Confirm website output exists
+        run: |
+          test -s site/index.html
+          echo 'Website index.html exists and is not empty.'
+
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
+
       - name: Upload static website
+        id: pages_artifact
         uses: actions/upload-pages-artifact@v4
         with:
           path: site
+
+      - name: Confirm GitHub Pages artifact was uploaded
+        env:
+          PAGES_ARTIFACT_ID: ${{ steps.pages_artifact.outputs.artifact_id }}
+        run: |
+          if [ -z "$PAGES_ARTIFACT_ID" ]; then
+            echo 'ERROR: The Pages upload returned no artifact ID.'
+            exit 1
+          fi
+          echo "GitHub Pages artifact uploaded: $PAGES_ARTIFACT_ID"
+
+  deploy:
+    # The deploy job cannot start until the build job completes successfully.
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
       - name: Publish site to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
