@@ -104,6 +104,21 @@ function draw() {
     text(meta,'span','',`Booked: ${str(b.booking_detail?.booking_datetime_local || fmtDate(b.booking_date))}`);
     text(meta,'span','',`Booking #${b.booking_id}`);
     if (b.facility) text(meta,'span','',`Facility: ${b.facility}`);
+    // MCSO demographics are shown on every card, without needing to expand it.
+    // Values are reproduced as listed by the source; absent values are not guessed.
+    const demo = text(main, 'dl', 'demographic-overview', '');
+    const displayFields = [
+      ['age_displayed', 'Age'],
+      ['gender', 'Sex / gender'],
+      ['height', 'Height'],
+      ['weight', 'Weight'],
+      ['race', 'Race (MCSO)']
+    ];
+    for (const [key, label] of displayFields) {
+      const pair = text(demo, 'div', 'demographic-item', '');
+      text(pair, 'dt', 'demographic-label', label);
+      text(pair, 'dd', 'demographic-value', b.booking_detail?.[key]);
+    }
     const charges = text(main, 'div', 'charges', '');
     if ((b.charges || []).length) for (const charge of b.charges) text(charges,'span','charge',charge);
     else text(charges,'span','charge','No charges listed in this snapshot');
