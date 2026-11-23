@@ -14,7 +14,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, parse_qsl
 from urllib.robotparser import RobotFileParser
 
 import requests
@@ -24,7 +24,39 @@ from archive_store import ArchiveStore, merge_state, export_site
 BASE = "https://apps.mcso.us/PAID"
 MAX_BOOKINGS_PER_RUN = 550
 LOG = logging.getLogger("multco_bookings")
-URL_RE = re.compile(r"https://apps\.mcso\.us/PAID/Home/Booking(?:/(\d+)/?|\?id=(\d+))$", re.I)
+URL_RE = re.compile(r"^/PAID/Home/Booking/(\d+)/?$", re.I)
+
+
+def booking_url_parts(url: str) -> tuple[str, str | None] | None:
+    """Validate ONLY official MCSO detail URLs (including release-specific links)."""
+    parts = urlsplit(url)
+    if (parts.scheme != "https" or parts.netloc != "apps.mcso.us"
+            or parts.fragment or parts.username or parts.password):
+        return None
+    legacy = URL_RE.fullmatch(parts.path)
+    if legacy and not parts.query:
+        return legacy.group(1), None
+    if parts.path != "/PAID/Home/Booking":
+        return None
+    query = parse_qsl(parts.query, keep_blank_values=True)
+    if len(query) not in (1, 2) or query[0][0] != "id":
+        return None
+    bid = query[0][1]
+    if not re.fullmatch(r"\d{1,12}", bid):
+        return None
+    if len(query) == 1:
+        return bid, None
+    if query[1][0] != "releaseId" or not re.fullmatch(r"\d{1,12}", query[1][1]):
+        return None
+    return bid, query[1][1]
+
+
+def canonical_booking_url(url: str) -> str | None:
+    parts = booking_url_parts(url)
+    if parts is None:
+        return None
+    bid, release_id = parts
+    return f"{BASE}/Home/Booking?id={bid}" + (f"&releaseId={release_id}" if release_id else "")
 
 LABELS = {
     "name": {"name", "full name", "person name", "person in custody", "inmate name", "booked name"},
@@ -68,9 +100,10 @@ def parse_booking_html(html: str, url: str) -> dict | None:
     Intentionally excludes DOB, address, race, aliases, SWIS, and all photos.
     Does NOT use a page's unlabelled heading as proof of identity.
     """
-    m = URL_RE.fullmatch(url)
-    if not m:
+    canonical = canonical_booking_url(url)
+    if canonical is None:
         return None
+    bid, _release_id = booking_url_parts(canonical)
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "nav", "footer"]):
         tag.decompose()
@@ -119,6 +152,17 @@ def parse_booking_html(html: str, url: str) -> dict | None:
         elif field not in fields:
             fields[field] = value
 
+    # MCSO's confirmed 2026 booking page uses one .charge-description-display
+    # span per charge, inside #charge-info.  Don't mistake its instructional
+    # "Click on each court case..." message for a charge.
+    official_charges = [clean(tag.get_text(" ", strip=True), 300)
+                        for tag in soup.select("#charge-info .charge-description-display")]
+    if official_charges:
+        charges = [value for value in official_charges if value]
+    else:
+        charges = [value for value in charges
+                   if not value.casefold().startswith("click on each court case number")]
+
     name = fields.get("name", "")
     booking_date = normalize_date(fields.get("booking_date", ""))
     if not name or not booking_date or len(name) < 3 or len(name) > 110:
@@ -128,12 +172,12 @@ def parse_booking_html(html: str, url: str) -> dict | None:
     if re.search(r"\bjuvenile\b|\byouth custody\b", text, flags=re.I):
         return None
     return {
-        "booking_id": m.group(1) or m.group(2),
+        "booking_id": bid,
         "name": name,
         "booking_date": booking_date,
         "charges": charges[:20],
         "facility": clean(fields.get("facility", ""), 100),
-        "source_url": url,
+        "source_url": canonical,
         "last_seen_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
 
@@ -177,11 +221,11 @@ def get_page_links(page) -> list[str]:
             absolute = BASE + "/" + href
         else:
             absolute = urljoin(page.url, href)
-        m = URL_RE.fullmatch(absolute)
-        if m:
-            # Normalize legacy paths to the confirmed 2026 address format.
-            urls.add(f"{BASE}/Home/Booking?id={m.group(1) or m.group(2)}")
-    return sorted(urls, key=lambda u: int(u.rsplit('=', 1)[-1]))
+        canonical = canonical_booking_url(absolute)
+        if canonical:
+            # Preserve releaseId: one booking number may have multiple occurrences.
+            urls.add(canonical)
+    return sorted(urls, key=lambda u: (int(booking_url_parts(u)[0]), int(booking_url_parts(u)[1] or 0)))
 
 
 def gather_links(page) -> list[str]:
@@ -248,10 +292,9 @@ def collect(contact: str = "", site: Path = Path("site")) -> int:
             context = browser.new_context(user_agent=ua)
             page = context.new_page()
             links = gather_links(page)
-            known = {str(item.get("booking_id")) for item in previous.get("bookings", [])}
-            ids = [link.rsplit("=", 1)[-1] for link in links]
-            LOG.info("Official recent results: %d links (%d new booking IDs, %d previously collected)",
-                     len(links), sum(bid not in known for bid in ids), sum(bid in known for bid in ids))
+            known = {item.get("source_url") for item in previous.get("bookings", [])}
+            LOG.info("Official recent results: %d links (%d new record links, %d previously collected)",
+                     len(links), sum(link not in known for link in links), sum(link in known for link in links))
             # We do not probe missing consecutive IDs: unpublished/invalid ID values
             # must never be assumed to represent accessible booking records.
             records: list[dict] = []

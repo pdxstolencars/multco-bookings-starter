@@ -50,9 +50,13 @@ def clean_record(item: dict, now: datetime, max_age: int) -> dict | None:
     # Do not trust arbitrary external URLs, even when a record is loaded from storage.
     expected_url = SOURCE_PREFIX + bid
     supplied_url = item.get("source_url", "")
-    if not isinstance(supplied_url, str) or supplied_url.rstrip("/") not in {
-        expected_url, LEGACY_SOURCE_PREFIX + bid
-    }:
+    if not isinstance(supplied_url, str):
+        return None
+    if supplied_url.rstrip("/") in {expected_url, LEGACY_SOURCE_PREFIX + bid}:
+        canonical_url = expected_url
+    elif re.fullmatch(re.escape(expected_url) + r"&releaseId=\d{1,12}", supplied_url):
+        canonical_url = supplied_url
+    else:
         return None
     charges = item.get("charges", [])
     if not isinstance(charges, list):
@@ -63,7 +67,7 @@ def clean_record(item: dict, now: datetime, max_age: int) -> dict | None:
         "booking_date": day,
         "charges": [str(c).strip()[:300] for c in charges[:20] if str(c).strip()],
         "facility": str(item.get("facility", "")).strip()[:100],
-        "source_url": expected_url,
+        "source_url": canonical_url,
     }
 
 
@@ -87,9 +91,9 @@ def merge_state(state: dict, incoming: list[dict], now: datetime) -> dict:
     for item in list(state.get("bookings", [])) + list(incoming):
         rec = clean_record(item, now, days)
         if rec and rec["booking_id"] not in suppressed:
-            values[rec["booking_id"]] = rec
+            values[rec["source_url"]] = rec
     result = {**state}
-    result["bookings"] = sorted(values.values(), key=lambda r: (r["booking_date"], int(r["booking_id"])), reverse=True)
+    result["bookings"] = sorted(values.values(), key=lambda r: (r["booking_date"], int(r["booking_id"]), r["source_url"]), reverse=True)
     result["retention_days"] = days
     result["last_updated_utc"] = now.isoformat(timespec="seconds")
     result["first_collection_utc"] = state.get("first_collection_utc") or result["last_updated_utc"]
@@ -120,8 +124,8 @@ def export_site(state: dict, site: Path = Path("site"), now: datetime | None = N
     for item in state.get("bookings", []):
         rec = clean_record(item, now, days)
         if rec and rec["booking_id"] not in excluded:
-            records[rec["booking_id"]] = rec
-    all_records = sorted(records.values(), key=lambda r: (r["booking_date"], int(r["booking_id"])), reverse=True)
+            records[rec["source_url"]] = rec
+    all_records = sorted(records.values(), key=lambda r: (r["booking_date"], int(r["booking_id"]), r["source_url"]), reverse=True)
     newest = (now.date() - timedelta(days=7)).isoformat()
     recent = [r for r in all_records if r["booking_date"] >= newest]
     years = {}
