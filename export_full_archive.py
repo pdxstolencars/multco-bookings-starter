@@ -42,6 +42,20 @@ def valid_source(url: str, bid: str) -> bool:
     )
 
 
+def _same_charge_text(detailed: str, short: str) -> bool:
+    """Reconcile two extracts of the SAME page without changing charge meaning.
+
+    The collector collapses all whitespace and truncates charge summaries at
+    300 characters; the full-detail parser preserves original spacing and
+    length. Neither difference should invalidate an otherwise identical charge.
+    """
+    detail_normalized = " ".join(detailed.split())
+    short_normalized = " ".join(short.split())
+    return detail_normalized == short_normalized or (
+        len(short_normalized) == 300 and detail_normalized.startswith(short_normalized)
+    )
+
+
 def public_record(raw: dict) -> dict:
     """Select only the fields collected from the public MCSO booking detail page."""
     if not isinstance(raw, dict):
@@ -85,8 +99,10 @@ def public_record(raw: dict) -> dict:
         })
     plain_charges = [c["description"] for case in case_groups for c in case["charges"]]
     raw_charges = raw.get("charges", [])
-    if not isinstance(raw_charges, list) or plain_charges != raw_charges:
-        raise ValueError("Charge list does not match case details")
+    if (not isinstance(raw_charges, list) or len(plain_charges) != len(raw_charges)
+            or any(not isinstance(short, str) or not _same_charge_text(full, short)
+                   for full, short in zip(plain_charges, raw_charges))):
+        raise ValueError(f"Booking {bid}: Charge list does not match case details")
     sort_date = date + "T00:00:00"
     if detail.get("booking_datetime_local"):
         try:
@@ -164,7 +180,10 @@ def collect_public_records(client, bucket: str) -> tuple[list[dict], set[str]]:
                 envelope = read_if_present(client, bucket, key)
                 if not isinstance(envelope, dict) or envelope.get("private_full_record") is not True:
                     raise ValueError("Unexpected record wrapper")
-                record = public_record(envelope.get("record"))
+                try:
+                    record = public_record(envelope.get("record"))
+                except ValueError as exc:
+                    raise ValueError(f"R2 record {key}: {exc}") from exc
                 if record["booking_id"] in suppressed:
                     continue
                 prev = data.get(record["booking_id"])
