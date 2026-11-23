@@ -19,8 +19,8 @@ on:
         required: false
         type: string
   schedule:
-  - cron: '45 * * * *'
-    timezone: 'America/Los_Angeles'
+    - cron: '45 * * * *'
+      timezone: 'America/Los_Angeles'
 
 permissions:
   contents: read
@@ -63,7 +63,7 @@ jobs:
       - name: Install Chromium for scheduled/manual collection
         if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.action == 'collect')
         run: python -m playwright install --with-deps chromium
-      - name: Collect sequential booking pages at 11:45 PM Pacific
+      - name: Collect sequential booking pages hourly at :45 Pacific
         if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.action == 'collect')
         run: |
           python sequential_live.py --mode daily --seed 1658164 --missing-threshold 5 --max-requests 200 --delay 2.0
