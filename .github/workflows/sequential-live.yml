@@ -16,22 +16,16 @@ on:
         required: true
         default: '20'
         type: string
-  schedule:
-    - cron: '45 23 * * *'
-      timezone: 'America/Los_Angeles'
 
 permissions:
   contents: read
 
 concurrency:
-  group: multco-private-sequential-collector
+  group: booking-archive-and-pages
   cancel-in-progress: false
 
 jobs:
   sequential-private:
-    # Scheduled scanning stays off until explicitly enabled in Settings ->
-    # Secrets and variables -> Actions -> Variables.
-    if: github.event_name != 'schedule' || vars.ENABLE_SEQUENTIAL_COLLECTION == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -58,7 +52,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "${{ github.event_name }}" == "schedule" || "$RUN_TYPE" == "daily" ]]; then
+          if [[ "$RUN_TYPE" == "daily" ]]; then
             python sequential_live.py --mode daily --seed 1658164 --missing-threshold 5 --max-requests "${MAX_REQUESTS:-100}" --delay 2.0
           elif [[ "$RUN_TYPE" == "range_test" ]]; then
             python sequential_live.py --mode range --start 1658100 --end 1658163 --max-requests "${MAX_REQUESTS:-20}" --delay 2.0

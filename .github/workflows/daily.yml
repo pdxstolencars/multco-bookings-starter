@@ -6,24 +6,21 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: "Use probe for a read-only live test; do not enable collect until the result is verified"
+        description: "Publish existing archive, collect new IDs then publish, or suppress one booking"
         required: true
-        default: preview
+        default: publish
         type: choice
         options:
-          - preview
-          - probe
-          - init
+          - publish
           - collect
-          - export
           - suppress
       booking_id:
-        description: "Numeric booking ID (suppress only)"
+        description: "Only for suppress action: numeric booking ID"
         required: false
         type: string
   schedule:
-    - cron: '45 23 * * *'  # 11:45 PM Pacific daily (GitHub may start runs late)
-      timezone: 'America/Los_Angeles'  # Automatically handles PST/PDT
+    - cron: '45 23 * * *'
+      timezone: 'America/Los_Angeles'
 
 permissions:
   contents: read
@@ -36,14 +33,14 @@ concurrency:
 
 jobs:
   publish:
-    # A fresh repository publishes only the empty website preview.
-    # Automatic daily collection is disabled until the owner explicitly sets ENABLE_DAILY_COLLECTION=true.
-    if: github.event_name != 'schedule' || vars.ENABLE_DAILY_COLLECTION == 'true'
+    # Only the explicitly enabled source collector runs on a timer.
+    if: github.event_name != 'schedule' || vars.ENABLE_SEQUENTIAL_COLLECTION == 'true'
     runs-on: ubuntu-24.04
-    environment: github-pages
+    timeout-minutes: 55
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     env:
-      ARCHIVE_BACKEND: s3
-      ARCHIVE_RETENTION_DAYS: '730'
       ARCHIVE_BUCKET: ${{ secrets.ARCHIVE_BUCKET }}
       ARCHIVE_ENDPOINT_URL: ${{ secrets.ARCHIVE_ENDPOINT_URL }}
       ARCHIVE_ACCESS_KEY_ID: ${{ secrets.ARCHIVE_ACCESS_KEY_ID }}
@@ -58,42 +55,32 @@ jobs:
         run: |
           python -m pip install -r requirements.txt pytest
           python -m pytest -q
-      - name: Block live actions until the feed and private storage are explicitly enabled
-        if: github.event_name == 'workflow_dispatch' && inputs.action != 'preview' && inputs.action != 'init' && inputs.action != 'probe' && vars.ENABLE_DAILY_COLLECTION != 'true'
+      - name: Refuse manual collection until daily collection is enabled
+        if: github.event_name == 'workflow_dispatch' && inputs.action == 'collect' && vars.ENABLE_SEQUENTIAL_COLLECTION != 'true'
         run: |
-          echo 'Live collection/archive not enabled. First complete MCSO permissions, live parser testing and private S3 storage setup.'
+          echo 'Set Actions variable ENABLE_SEQUENTIAL_COLLECTION=true before starting live collection.'
           exit 1
-      - name: Initialize private archive once
-        if: github.event_name == 'workflow_dispatch' && inputs.action == 'init'
-        run: python archive_store.py init
-      - name: Install Chromium for one-time public-search test
-        if: github.event_name == 'workflow_dispatch' && inputs.action == 'probe'
+      - name: Install Chromium for scheduled/manual collection
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.action == 'collect')
         run: python -m playwright install --with-deps chromium
-      - name: Probe MCSO search and three details without writing or publishing
-        if: github.event_name == 'workflow_dispatch' && inputs.action == 'probe'
-        run: python collector.py --probe
-      - name: Install browser for the live collector
-        if: vars.ENABLE_DAILY_COLLECTION == 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.action == 'collect'))
-        run: python -m playwright install --with-deps chromium
-      - name: Collect verified bookings and export recent plus archive views
-        if: vars.ENABLE_DAILY_COLLECTION == 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.action == 'collect'))
-        run: python collector.py
-      - name: Suppress a booking and republish
-        if: vars.ENABLE_DAILY_COLLECTION == 'true' && github.event_name == 'workflow_dispatch' && inputs.action == 'suppress'
+      - name: Collect sequential booking pages at 11:45 PM Pacific
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.action == 'collect')
+        run: |
+          python sequential_live.py --mode daily --seed 1658164 --missing-threshold 5 --max-requests 200 --delay 2.0
+      - name: Suppress one booking ID in future public exports
+        if: github.event_name == 'workflow_dispatch' && inputs.action == 'suppress'
         env:
           BOOKING_ID: ${{ inputs.booking_id }}
-        run: python archive_store.py suppress "$BOOKING_ID"
-      - name: Export previously collected archive without scraping
-        if: vars.ENABLE_DAILY_COLLECTION == 'true' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.action == 'preview' || inputs.action == 'export')))
-        run: python archive_store.py export
+        run: python export_full_archive.py --site site --suppress-booking-id "$BOOKING_ID"
+      - name: Export all verified full-detail bookings for the website
+        if: github.event_name != 'workflow_dispatch' || inputs.action != 'suppress'
+        run: python export_full_archive.py --site site
       - name: Configure GitHub Pages
-        if: github.event_name != 'workflow_dispatch' || (inputs.action != 'init' && inputs.action != 'probe')
         uses: actions/configure-pages@v5
       - name: Upload static website
-        if: github.event_name != 'workflow_dispatch' || (inputs.action != 'init' && inputs.action != 'probe')
         uses: actions/upload-pages-artifact@v4
         with:
           path: site
       - name: Publish site to GitHub Pages
-        if: github.event_name != 'workflow_dispatch' || (inputs.action != 'init' && inputs.action != 'probe')
+        id: deployment
         uses: actions/deploy-pages@v4
