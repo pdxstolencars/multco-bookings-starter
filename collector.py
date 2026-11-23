@@ -250,6 +250,45 @@ def get_page_links(page) -> list[str]:
     return sorted(urls, key=lambda u: (int(booking_url_parts(u)[0]), int(booking_url_parts(u)[1] or 0)))
 
 
+
+def summarize_search_page(html: str, url: str) -> dict:
+    """Privacy-preserving diagnostics; never log names, booking IDs, or HTML.
+
+    Distinguishes missing result links from visible human-verification blocks,
+    unexpected page types, and table parsing changes. Indicators are suggestive,
+    not proof of why a search failed.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    for script in soup(["script", "style"]):
+        script.decompose()
+    visible_text = soup.get_text(" ", strip=True).casefold()
+    challenge_elements = bool(soup.select(
+        '[class*="captcha" i], [id*="captcha" i], '
+        'iframe[src*="recaptcha" i], iframe[src*="hcaptcha" i], '
+        'iframe[src*="turnstile" i], [class*="cf-turnstile" i]'
+    ))
+    challenge_text = any(x in visible_text for x in (
+        "captcha", "verify you are human", "verify you're human",
+        "human verification", "checking your browser", "security challenge"
+    ))
+    denied = any(x in visible_text for x in (
+        "access denied", "request blocked", "too many requests", "rate limit exceeded"
+    ))
+    count_match = re.search(r"there were\s+(\d+)\s+persons? found", visible_text)
+    path = urlsplit(url).path  # omit any private query parameters
+    return {
+        "path": path,
+        "title_is_search_results": bool(soup.title and "searchresults" in soup.title.get_text().replace(" ", "").casefold()),
+        "result_table_present": bool(soup.select_one("table.search-results")),
+        "result_table_rows": len(soup.select("table.search-results tbody tr")),
+        "booking_anchor_candidates": len(soup.select('a[href*="/PAID/Home/Booking"]')),
+        "results_count_reported": int(count_match.group(1)) if count_match else None,
+        "captcha_indicators_present": challenge_elements or challenge_text,
+        "access_denied_indicators_present": denied,
+        "iframe_count": len(soup.select("iframe")),
+    }
+
+
 def gather_links(page) -> list[str]:
     """Use the site's documented 'Booked Last 7 Days' form filter.
 
@@ -294,7 +333,15 @@ def gather_links(page) -> list[str]:
         if page.url == old and n > 0 and not get_page_links(page):
             break
     if not all_links:
-        raise RuntimeError("No detail links found in MCSO results; verify page structure before publishing")
+        # Only aggregate diagnostics are emitted to GitHub logs. No captured HTML,
+        # personal details, query strings, booking IDs, or screenshots are saved.
+        diagnostic = summarize_search_page(page.content(), page.url)
+        LOG.error("MCSO SEARCH DIAGNOSTIC (no personal data): %s", json.dumps(diagnostic, sort_keys=True))
+        if diagnostic["captcha_indicators_present"]:
+            raise RuntimeError("MCSO appears to require human verification; stop, do not bypass the challenge")
+        if diagnostic["access_denied_indicators_present"]:
+            raise RuntimeError("MCSO appears to restrict automated access; stop, do not retry around the block")
+        raise RuntimeError("No detail links in results; use diagnostic line above to identify the page type")
     return sorted(all_links)
 
 
