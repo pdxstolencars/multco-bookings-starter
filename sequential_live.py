@@ -118,7 +118,18 @@ def classify_page(status: int | None, html: str, booking_id: int, final_url: str
     try:
         full = parse_full_record_html(html, expected)
     except (ValueError, TypeError, KeyError) as exc:
-        raise ScanError("Booking content could not be validated") from exc
+        # Show only a predefined, non-personal diagnostic. Do not log raw HTML,
+        # booking names, or response bodies in public GitHub Actions logs.
+        known_reasons = {
+            "Could not validate booking ID, name, and booking date": "name or booking date missing/unrecognized",
+            "Booking number in HTML does not match source URL": "booking ID mismatch",
+            "Inconsistent booking name": "detail name disagrees with validated name",
+            "Unrecognized booking timestamp": "detail timestamp has an unexpected format",
+            "Inconsistent booking date": "detail date disagrees with validated date",
+            "Structured charge count differs from validated simple list": "charge count differs between detail and summary",
+        }
+        reason = known_reasons.get(str(exc), f"unexpected parser {type(exc).__name__}")
+        raise ScanError(f"Booking content could not be validated: {reason}") from exc
     if full.get("booking_id") != str(booking_id):
         raise ScanError("Validated booking ID did not match")
     return PageResult("FOUND", full)
