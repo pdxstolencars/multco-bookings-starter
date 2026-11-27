@@ -6,6 +6,7 @@ intended for private review; do not automatically publish raw private records.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import re
 from bs4 import BeautifulSoup
 from collector import parse_booking_html, booking_url_parts
 
@@ -103,6 +104,30 @@ def parse_full_record_html(html: str, source_url: str) -> dict:
             raise ValueError("Unrecognized booking timestamp") from None
         if full_date != minimal["booking_date"]:
             raise ValueError("Inconsistent booking date")
-    if sum(len(case["charges"]) for case in cases) != len(minimal["charges"]):
+    # The legacy summary parser caps its charge list at 20. A booking with
+    # additional charges must not fail validation or lose those entries.
+    # First independently confirm each case-grouped entry matches the source.
+    structured = [charge["description"] for case in cases for charge in case["charges"]]
+    official = [_text(tag) for tag in soup.select("#charge-info .charge-description-display")]
+    official = [description for description in official if description]
+    if structured != official:
         raise ValueError("Structured charge count differs from validated simple list")
+
+    # The summary parser collapses whitespace and limits each description to
+    # 300 characters. Require exact agreement with the summary (or its known
+    # 20-charge prefix), preserving duplicates and original order.
+    def as_summary(description: str) -> str:
+        return re.sub(r"\s+", " ", description).strip()[:300]
+
+    expected_summary = [as_summary(description) for description in official]
+    short_summary = minimal["charges"]
+    if short_summary == expected_summary:
+        pass
+    elif (len(short_summary) == 20 and len(expected_summary) > 20
+          and short_summary == expected_summary[:20]):
+        pass  # known summary truncation; full detail is independently verified
+    else:
+        raise ValueError("Structured charge count differs from validated simple list")
+
+    result["charges"] = structured
     return result
